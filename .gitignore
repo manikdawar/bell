@@ -1,0 +1,14 @@
+# Data and output files
+*.csv
+*.xlsx
+*.txt
+*.pdf
+*.html
+
+# Folders
+bell_data/
+.claude/
+__pycache__/
+
+# macOS
+.DS_Store
