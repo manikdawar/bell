@@ -171,6 +171,24 @@ combined = pd.concat(
     ignore_index=True,
 )
 
+# ---------- SORT: NEWEST ORDERS FIRST ----------
+def sort_by_date_desc(df, date_col):
+    if df.empty or date_col not in df.columns:
+        return df
+    return df.sort_values(
+        date_col,
+        ascending=False,
+        key=lambda s: pd.to_datetime(s, errors="coerce", utc=True),
+        na_position="last",
+        kind="stable",
+    ).reset_index(drop=True)
+
+
+combined = sort_by_date_desc(combined, "order_date")
+amazon_all = sort_by_date_desc(amazon_all, "purchase-date")
+flipkart_all = sort_by_date_desc(flipkart_all, "order_date")
+meesho_all = sort_by_date_desc(meesho_all, "order_date")
+
 # ---------- WRITE OUTPUT ----------
 with pd.ExcelWriter(OUT_PATH, engine="openpyxl") as writer:
     combined.to_excel(writer, sheet_name="Combined", index=False)
