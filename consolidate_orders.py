@@ -3,9 +3,11 @@ Consolidates Amazon / Flipkart / Meesho order reports in this folder into
 Consolidated_Orders.xlsx (sheets: Combined, Amazon, Flipkart, Meesho).
 
 Amazon reports are read either as the native tab-separated .txt download
-("All Orders" flat file) or as .xlsx. Flipkart and Meesho reports are .xlsx.
+("All Orders" flat file) or as .xlsx. Flipkart reports are the seller-portal
+"Orders" CSV export. Meesho reports are .xlsx.
 Amazon rows are de-duplicated on order-item-id (keeping the most recently
-updated row), so overlapping date-range reports don't double-count orders.
+updated row) and Flipkart rows on ORDER ITEM ID (keeping the row from the
+newest file), so overlapping date-range reports don't double-count orders.
 
 Incremental: if Consolidated_Orders.xlsx already exists, only report files not
 already recorded in it (tracked by filename) are parsed and appended. If it
@@ -53,11 +55,15 @@ def month_label(dates):
     return dates.dt.strftime("%b %Y").mode()[0]
 
 
+# long numeric IDs must stay text, or Excel/pandas round them and de-duplication breaks
+ID_COLUMNS = {c: str for c in ("ORDER ITEM ID", "Order Id", "order-item-id", "amazon-order-id", "sub_order_num", "Tracking ID")}
+
+
 def load_existing_sheet(sheet_name):
     if not os.path.exists(OUT_PATH):
         return pd.DataFrame()
     try:
-        return pd.read_excel(OUT_PATH, sheet_name=sheet_name)
+        return pd.read_excel(OUT_PATH, sheet_name=sheet_name, dtype=ID_COLUMNS)
     except ValueError:
         return pd.DataFrame()
 
@@ -69,13 +75,17 @@ def new_files_only(files, existing_df):
     return [f for f in files if os.path.basename(f) not in already]
 
 
-def read_amazon_txt(fname):
+def read_text_table(fname, **kwargs):
     for enc in ("utf-8-sig", "cp1252"):
         try:
-            return pd.read_csv(fname, sep="\t", encoding=enc, dtype={"amazon-order-id": str, "order-item-id ": str, "order-item-id": str})
+            return pd.read_csv(fname, encoding=enc, **kwargs)
         except UnicodeDecodeError:
             continue
     raise ValueError(f"Could not decode {fname}")
+
+
+def read_amazon_txt(fname):
+    return read_text_table(fname, sep="\t", dtype={"amazon-order-id": str, "order-item-id ": str, "order-item-id": str})
 
 
 def parse_amazon(fname):
@@ -89,13 +99,32 @@ def parse_amazon(fname):
     return df
 
 
+FLIPKART_NUMERIC = [
+    "CGST", "IGST", "SGST", "Invoice Amount", "Selling Price Per Item",
+    "Shipping and Handling Charges", "Quantity", "Price inc. FKMP Contribution & Subsidy",
+    "Package Length (cm)", "Package Breadth (cm)", "Package Height (cm)", "Package Weight (kg)",
+]
+FLIPKART_DATES = {
+    "Ordered On": "%d-%b-%y",
+    "Invoice Date (mm/dd/yy)": "%m/%d/%Y",
+    "Dispatch After date": "%m/%d/%Y %H:%M",
+    "Dispatch by date": "%m/%d/%Y %H:%M",
+}
+
+
 def parse_flipkart(fname):
-    df = pd.read_excel(fname, sheet_name="Orders")
+    df = read_text_table(fname, dtype=str)
     df.columns = [c.strip() for c in df.columns]
-    for col in ("sku", "fsn", "product_title"):
+    df = df.apply(lambda s: s.str.strip())
+    df["ORDER ITEM ID"] = df["ORDER ITEM ID"].str.lstrip("'")
+    for col in FLIPKART_NUMERIC:
         if col in df.columns:
-            df[col] = df[col].apply(clean_str).str.replace(r"^SKU:", "", regex=True)
-    df.insert(0, "report_month", month_label(df["order_date"]))
+            df[col] = pd.to_numeric(df[col], errors="coerce")
+    for col, fmt in FLIPKART_DATES.items():
+        if col in df.columns:
+            df[col] = pd.to_datetime(df[col], format=fmt, errors="coerce")
+    # one export can span several months, so label each row by its own order month
+    df.insert(0, "report_month", df["Ordered On"].dt.strftime("%b %Y"))
     df.insert(1, "source_file", os.path.basename(fname))
     return df
 
@@ -122,6 +151,17 @@ def dedupe_amazon(df):
     return deduped.reset_index(drop=True)
 
 
+def dedupe_flipkart(df):
+    if df.empty or "ORDER ITEM ID" not in df.columns:
+        return df
+    key = df["ORDER ITEM ID"].astype(str).str.strip().str.lstrip("'").str.replace(r"\.0$", "", regex=True)
+    deduped = df[~key.duplicated(keep="last")]
+    dropped = len(df) - len(deduped)
+    if dropped:
+        print(f"Flipkart: replaced {dropped} duplicate order line(s) with the newest file's version")
+    return deduped.reset_index(drop=True)
+
+
 def build_platform(keyword, parse_fn, sheet_name, exts=("xlsx",)):
     existing = load_existing_sheet(sheet_name)
     new_files = new_files_only(find_files(keyword, exts), existing)
@@ -135,7 +175,7 @@ def build_platform(keyword, parse_fn, sheet_name, exts=("xlsx",)):
 
 
 amazon_all = dedupe_amazon(build_platform("amazon", parse_amazon, "Amazon", exts=("xlsx", "txt")))
-flipkart_all = build_platform("flipkart", parse_flipkart, "Flipkart")
+flipkart_all = dedupe_flipkart(build_platform("flipkart", parse_flipkart, "Flipkart", exts=("csv",)))
 meesho_all = build_platform("meesho", parse_meesho, "Meesho")
 
 
@@ -164,19 +204,23 @@ def norm_amazon(df):
 def norm_flipkart(df):
     if df.empty:
         return pd.DataFrame()
+    amount = pd.to_numeric(df["Invoice Amount"], errors="coerce")
+    gst_rate = pd.to_numeric(df["IGST"], errors="coerce").fillna(
+        pd.to_numeric(df["CGST"], errors="coerce") + pd.to_numeric(df["SGST"], errors="coerce")
+    )
     return pd.DataFrame({
         "platform": "Flipkart",
         "report_month": df["report_month"],
-        "order_id": df["order_id"],
-        "order_date": pd.to_datetime(df["order_date"], errors="coerce"),
-        "product_name": df["product_title"],
-        "sku": df["sku"],
-        "quantity": df["quantity"],
-        "amount": pd.NA,
-        "tax": pd.NA,
-        "status": df["order_item_status"],
-        "city": pd.NA,
-        "state": pd.NA,
+        "order_id": df["Order Id"],
+        "order_date": pd.to_datetime(df["Ordered On"], errors="coerce"),
+        "product_name": df["Product"],
+        "sku": df["SKU"],
+        "quantity": df["Quantity"],
+        "amount": amount,
+        "tax": (amount * gst_rate / (100 + gst_rate)).round(2),
+        "status": df["Order State"],
+        "city": df["City"],
+        "state": df["State"],
         "source_file": df["source_file"],
     })
 
@@ -205,6 +249,8 @@ combined = pd.concat(
     [norm_amazon(amazon_all), norm_flipkart(flipkart_all), norm_meesho(meesho_all)],
     ignore_index=True,
 )
+# platforms spell states differently ("ODISHA" vs "Odisha"), so normalise for grouping
+combined["state"] = combined["state"].str.strip().str.upper()
 
 # ---------- SORT: NEWEST ORDERS FIRST ----------
 def sort_by_date_desc(df, date_col):
@@ -221,7 +267,7 @@ def sort_by_date_desc(df, date_col):
 
 combined = sort_by_date_desc(combined, "order_date")
 amazon_all = sort_by_date_desc(amazon_all, "purchase-date")
-flipkart_all = sort_by_date_desc(flipkart_all, "order_date")
+flipkart_all = sort_by_date_desc(flipkart_all, "Ordered On")
 meesho_all = sort_by_date_desc(meesho_all, "order_date")
 
 # ---------- WRITE OUTPUT ----------

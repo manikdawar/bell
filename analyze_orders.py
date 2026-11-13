@@ -189,18 +189,19 @@ def main():
         return "In Transit"
 
     def flipkart_bucket(s):
-        if s in ("CANCELLED", "REJECTED"):
+        s = str(s).strip().lower()
+        if "cancel" in s or "reject" in s:
             return "Cancelled"
-        if s == "DELIVERED":
-            return "Delivered"
-        if s in ("RETURNED", "RETURN_REQUESTED"):
+        if "return" in s:
             return "Returned"
+        if s == "delivered":
+            return "Delivered"
         return "In Transit"
 
     amazon = amazon.copy()
     flipkart = flipkart.copy()
     amazon["bucket"] = amazon["order-status"].apply(amazon_bucket)
-    flipkart["bucket"] = flipkart["order_item_status"].apply(flipkart_bucket)
+    flipkart["bucket"] = flipkart["Order State"].apply(flipkart_bucket)
 
     BUCKETS = ["Delivered", "In Transit", "Pending", "Returned", "Cancelled"]
 
@@ -212,7 +213,24 @@ def main():
     status_pct = {"Amazon": bucket_pct(amazon), "Flipkart": bucket_pct(flipkart)}
 
     amazon_return_rate = pct((amazon["bucket"] == "Returned").sum(), len(amazon))
+    amazon_cancel_rate = pct((amazon["bucket"] == "Cancelled").sum(), len(amazon))
     flipkart_return_rate = pct((flipkart["bucket"] == "Returned").sum(), len(flipkart))
+    flipkart_cancel_rate = pct((flipkart["bucket"] == "Cancelled").sum(), len(flipkart))
+
+    # ---------- returns (Amazon + Flipkart; Meesho's export has no status) ----------
+    status_lines = combined[combined["platform"].isin(["Amazon", "Flipkart"])].copy()
+    status_lines["returned"] = status_lines["status"].astype(str).str.contains("return", case=False)
+    rr = status_lines.groupby(["platform", "period"])["returned"].mean().mul(100).round(1)
+    return_platforms = sorted(status_lines["platform"].unique())
+    return_rate_by_month = {
+        p: [float(rr.get((p, per), 0.0)) for per in periods] for p in return_platforms
+    }
+    by_sku = status_lines.dropna(subset=["sku"]).groupby("sku")["returned"].agg(["sum", "size"])
+    by_sku = by_sku[by_sku["sum"] > 0].sort_values(["sum", "size"], ascending=[False, True]).head(6)
+    top_returned_skus = [
+        [sku if len(sku) <= 26 else sku[:25] + "…", int(r["sum"]), int(r["size"])]
+        for sku, r in by_sku.iterrows()
+    ]
 
     # ---------- vehicle brand concentration ----------
     vv = valid.copy()
@@ -240,16 +258,6 @@ def main():
     quietest_day, quietest_count = min(weekday, key=lambda x: x[1])
     weekday_lift_pct = round(100 * (busiest_count - quietest_count) / quietest_count, 0) if quietest_count else 0
 
-    # ---------- flipkart SLA & returns ----------
-    dispatch_sla_breach_pct = pct((flipkart["dispatch_sla_breached"] == "Y").sum(), len(flipkart))
-    sla_by_period = flipkart.assign(period=pd.to_datetime(flipkart["order_date"], errors="coerce").dt.to_period("M"))
-    sla_by_period = sla_by_period.groupby("period")["dispatch_sla_breached"].apply(lambda s: pct((s == "Y").sum(), len(s)))
-    dispatch_sla_breach_by_month = [float(sla_by_period.get(p, 0.0)) for p in periods]
-
-    return_reasons = flipkart["return_reason"].value_counts().head(6)
-    return_reasons_list = [[k, int(v)] for k, v in return_reasons.items()]
-    top2_reason_share = pct(return_reasons.head(2).sum(), (flipkart["bucket"] == "Returned").sum())
-
     data = {
         "months": months,
         "orders_by_month": orders_by_month,
@@ -272,9 +280,9 @@ def main():
         "brand_total_named": brand_total_named,
         "top_states": top_states,
         "weekday": weekday,
-        "dispatch_sla_breach_pct": dispatch_sla_breach_pct,
-        "dispatch_sla_breach_by_month": dispatch_sla_breach_by_month,
-        "return_reasons": return_reasons_list,
+        "return_platforms": return_platforms,
+        "return_rate_by_month": return_rate_by_month,
+        "top_returned_skus": top_returned_skus,
         "platforms": platforms,
     }
 
@@ -296,9 +304,9 @@ def main():
 
     if len(revenue_platforms) >= 2:
         ranked = sorted(revenue_platforms, key=lambda p: aov[p], reverse=True)
-        hi, lo = ranked[0], ranked[1]
         revenue_insight = (
-            f"{hi}'s average order value (₹{aov[hi]:.2f}) is higher than {lo}'s (₹{aov[lo]:.2f})."
+            f"{ranked[0]} has the highest average order value (₹{aov[ranked[0]]:.2f}), followed by "
+            + ", ".join(f"{p} (₹{aov[p]:.2f})" for p in ranked[1:]) + "."
         )
     elif len(revenue_platforms) == 1:
         p = revenue_platforms[0]
@@ -313,18 +321,29 @@ def main():
     if missing_rev:
         revenue_insight += f" {', '.join(missing_rev)} revenue can't be compared — its export has no price field."
 
-    if flipkart_return_rate > amazon_return_rate and amazon_return_rate > 0 and len(return_reasons_list) >= 2:
-        ratio = round(flipkart_return_rate / amazon_return_rate, 1)
+    rates = {"Amazon": amazon_return_rate, "Flipkart": flipkart_return_rate}
+    hi, lo = sorted(rates, key=rates.get, reverse=True)
+    if rates[hi] > 0 and rates[lo] == 0:
         fulfillment_insight = (
-            f"Flipkart's return rate ({flipkart_return_rate}% of lines) is {ratio}x Amazon's ({amazon_return_rate}%), "
-            f"and {dispatch_sla_breach_pct}% of Flipkart dispatches miss the seller's own dispatch SLA. "
-            f"The top two return reasons ('{return_reasons_list[0][0]}', '{return_reasons_list[1][0]}') account for "
-            f"~{top2_reason_share}% of all Flipkart returns — pointing at pickup/dispatch delay, not product quality."
+            f"{hi} returns {rates[hi]}% of order lines; {lo} shows no returns yet in this data "
+            f"(its reports may be too recent for returns to have come back)."
+        )
+    elif rates[lo] > 0 and rates[hi] / rates[lo] >= 1.5:
+        fulfillment_insight = (
+            f"{hi}'s return rate ({rates[hi]}% of order lines) is {rates[hi] / rates[lo]:.1f}x {lo}'s ({rates[lo]}%)."
         )
     else:
         fulfillment_insight = (
-            f"Amazon return rate: {amazon_return_rate}%, Flipkart: {flipkart_return_rate}%. "
-            f"Flipkart dispatch-SLA breach rate: {dispatch_sla_breach_pct}%."
+            f"Return rates are similar: Amazon {amazon_return_rate}% and Flipkart {flipkart_return_rate}% of order lines."
+        )
+    if top_returned_skus:
+        sku, n, m = top_returned_skus[0]
+        fulfillment_insight += f" The most-returned SKU is {sku} ({n} of {m} lines, {pct(n, m)}%)."
+    fulfillment_insight += f" Amazon cancels {amazon_cancel_rate}% of lines before they ship."
+    if flipkart_cancel_rate == 0:
+        fulfillment_insight += (
+            " Flipkart's order export only lists invoiced orders, so it shows no cancellations — compare "
+            "return rates, not cancellation rates, across the two."
         )
 
     pack_insight = (
@@ -442,8 +461,8 @@ def build_pdf(data, narrative):
             y -= 0.025 + 0.02 * (len(wrap(body, 95).split("\n")))
 
         fig.text(0.07, 0.04, wrap(
-            "Built from Consolidated_Orders.xlsx by analyze_orders.py. Flipkart's export carries no price or "
-            "ship-to location; Meesho's export carries no product name or fulfillment status.", 100
+            "Built from Consolidated_Orders.xlsx by analyze_orders.py. Meesho's export carries no product name or "
+            "fulfillment status; Flipkart's export lists invoiced orders only, so it has no cancellations.", 100
         ), fontsize=7.5, color=COLOR["muted"])
         pdf.savefig(fig)
         plt.close(fig)
@@ -501,7 +520,7 @@ def build_pdf(data, narrative):
             "Returned": COLOR["serious"], "Cancelled": COLOR["critical"],
         }
         fig = plt.figure(figsize=(11, 8.5))
-        gs = fig.add_gridspec(2, 2, height_ratios=[1, 1.3], hspace=0.55, wspace=0.3)
+        gs = fig.add_gridspec(2, 2, height_ratios=[1, 1.3], hspace=0.55, wspace=0.65)
 
         ax0 = fig.add_subplot(gs[0, :])
         status_platforms = [p for p in ("Amazon", "Flipkart") if p in data["status_pct"]]
@@ -523,16 +542,23 @@ def build_pdf(data, narrative):
         ax0.tick_params(colors=COLOR["secondary"], labelsize=9)
 
         ax1 = fig.add_subplot(gs[1, 0])
-        ax1.bar([short_month(m) for m in months], data["dispatch_sla_breach_by_month"], color=COLOR["warning"])
-        for i, v in enumerate(data["dispatch_sla_breach_by_month"]):
-            ax1.text(i, v + 1, f"{v:.0f}%", ha="center", fontsize=8, color=COLOR["text"])
-        ax1.set_title("Flipkart dispatch-SLA breach rate by month (%)", fontsize=9.5, loc="left", color=COLOR["text"])
+        rps = data["return_platforms"]
+        bw = 0.8 / max(1, len(rps))
+        for i, p in enumerate(rps):
+            offs = [xi + (i - (len(rps) - 1) / 2) * bw for xi in range(len(months))]
+            ax1.bar(offs, data["return_rate_by_month"][p], width=bw, color=platform_color(p, platforms.index(p)), label=p)
+        ax1.set_xticks(list(range(len(months))))
+        ax1.set_xticklabels([short_month(m) for m in months])
+        ax1.legend(frameon=False, fontsize=8)
+        ax1.set_title("Return rate by month (% of order lines)", fontsize=9.5, loc="left", color=COLOR["text"])
         style_axes(ax1)
 
         ax2 = fig.add_subplot(gs[1, 1])
-        reasons = data["return_reasons"][::-1]
-        ax2.barh([r[0] for r in reasons], [r[1] for r in reasons], color=COLOR["serious"])
-        ax2.set_title("Flipkart return reasons (order lines)", fontsize=9.5, loc="left", color=COLOR["text"])
+        skus = data["top_returned_skus"][::-1]
+        ax2.barh([r[0] for r in skus], [r[1] for r in skus], color=COLOR["serious"])
+        for yi, r in enumerate(skus):
+            ax2.text(r[1], yi, f"  {r[1]} of {r[2]}", va="center", fontsize=7.5, color=COLOR["text"])
+        ax2.set_title("Most-returned SKUs (returned lines, Amazon + Flipkart)", fontsize=9.5, loc="left", color=COLOR["text"])
         ax2.spines["top"].set_visible(False); ax2.spines["right"].set_visible(False)
         ax2.tick_params(colors=COLOR["secondary"], labelsize=8)
 
@@ -769,11 +795,12 @@ TEMPLATE = r"""<!doctype html>
     </div>
     <div class="chart-row">
       <div class="chart-box chart-scroll">
-        <p class="chart-title">Flipkart dispatch-SLA breach rate by month (%)</p>
-        <svg id="chart-sla" viewBox="0 0 480 220"></svg>
+        <p class="chart-title">Return rate by month (% of order lines)</p>
+        <svg id="chart-return-rate" viewBox="0 0 480 260"></svg>
+        <div class="legend" id="legend-returns"></div>
       </div>
       <div class="chart-box chart-scroll">
-        <p class="chart-title">Flipkart return reasons (order lines)</p>
+        <p class="chart-title">Most-returned SKUs (returned lines, Amazon + Flipkart)</p>
         <svg id="chart-returns" viewBox="0 0 480 220"></svg>
       </div>
     </div>
@@ -821,9 +848,9 @@ TEMPLATE = r"""<!doctype html>
   <footer class="page-foot">
     Built from Consolidated_Orders.xlsx by analyze_orders.py — regenerated on every run from whatever data is in
     the workbook. The __LATEST_MONTH__ figures are partial and status-dependent metrics (returns/cancellations) are
-    under-counted for the latest month since many lines haven't resolved yet. Flipkart's export carries no price or
-    ship-to location; Meesho's export carries no product name or fulfillment status — each chart above uses only
-    the fields its own platform's export provides.
+    under-counted for the latest month since many lines haven't resolved yet. Meesho's export carries no product
+    name or fulfillment status, and Flipkart's export lists invoiced orders only (no cancellations) — each chart
+    above uses only the fields its own platform's export provides.
   </footer>
 
 </div>
@@ -1001,14 +1028,14 @@ function drawHorizBars(svgId, items, color, opts) {
     const bw = (innerW * v) / maxV;
     const col = opts.colorFn ? opts.colorFn(label, v) : color;
     const rect = svgNode('rect', { x: labelW, y: ry, width: Math.max(2, bw), height: rowH, rx: 4, fill: resolve(col) });
-    rect.addEventListener('mousemove', e => showTip(`<b>${label}</b><br>${opts.valueLabel ? opts.valueLabel(v) : v}`, e));
+    rect.addEventListener('mousemove', e => showTip(`<b>${label}</b><br>${opts.valueLabel ? opts.valueLabel(v, it) : v}`, e));
     rect.addEventListener('mouseleave', hideTip);
     svg.appendChild(rect);
     const lbl = svgNode('text', { x: labelW - 8, y: ry + rowH / 2 + 3, 'text-anchor': 'end', class: 'label-text' });
     lbl.textContent = label;
     svg.appendChild(lbl);
     const vlbl = svgNode('text', { x: labelW + bw + 8, y: ry + rowH / 2 + 3, 'text-anchor': 'start', class: 'value-label' });
-    vlbl.textContent = opts.valueLabel ? opts.valueLabel(v) : v;
+    vlbl.textContent = opts.valueLabel ? opts.valueLabel(v, it) : v;
     svg.appendChild(vlbl);
   });
 }
@@ -1086,11 +1113,10 @@ drawStatusStack('chart-status', ['Amazon', 'Flipkart'].filter(p => DATA.status_p
 })));
 legend('legend-status', DATA.status_buckets.map(b => ({ color: bucketColorMap[b], label: b })));
 
-drawSingleBars('chart-sla', DATA.months.map((m, i) => [m.replace(/ \d{4}/, ''), DATA.dispatch_sla_breach_by_month[i]]), COLORS.warning, {
-  valueLabel: v => v + '%',
-});
+drawGroupedBars('chart-return-rate', DATA.months, DATA.return_platforms.map(p => ({ name: p, color: platformColor(p, DATA.platforms.indexOf(p)), values: DATA.return_rate_by_month[p] })), { yFormat: v => v.toFixed(0) + '%' });
+legend('legend-returns', DATA.return_platforms.map(p => ({ color: platformColor(p, DATA.platforms.indexOf(p)), label: p })));
 
-drawHorizBars('chart-returns', DATA.return_reasons, COLORS.serious, { labelW: 160, valueLabel: v => v + ' lines' });
+drawHorizBars('chart-returns', DATA.top_returned_skus, COLORS.serious, { labelW: 170, valueLabel: (v, it) => it ? v + ' of ' + it[2] + ' lines' : v + ' lines' });
 
 const brandTotal = DATA.brand_total_named;
 drawHorizBars('chart-brand', DATA.brand_units, COLORS.amazon, {
