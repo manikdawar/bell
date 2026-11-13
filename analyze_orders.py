@@ -10,6 +10,11 @@ All numbers and the narrative call-outs are recomputed from whatever data is
 in the workbook at run time, so this can be re-run every time new months are
 added.
 
+Order size is quantity x pack size, where pack size is parsed from the product
+name ("Pack of N" on Flipkart, "(NN Sets)" on Amazon). Unit/brand figures are
+reported in brake-pad sets on that basis; lines without a product name (Meesho)
+count as 1 set per unit.
+
 Requires: pandas, openpyxl, matplotlib
 """
 import calendar
@@ -56,6 +61,32 @@ def pct(n, d):
     return round(100 * n / d, 1) if d else 0.0
 
 
+# Pack size (brake-pad sets per listing unit) as written in the product name.
+# Tried in order; the first match wins:
+#   Flipkart: "... Vehicle Disc Pad Pack of 5" (checked first, because combo titles
+#             like "Apache 02 Sets Shine NM 1 Set ... Pack of 5" list per-vehicle sets
+#             before the pack total)
+#   Amazon:   "(05 Sets)", "(01 Set)", "Set 10 Sets)"; a few Flipkart titles: "| 5 Sets"
+#             (the first "N Sets" is the pack total, e.g. "Combo Pack (10 Sets) | ... (04 Sets)")
+#   Fallback: "Set of 5 Pads"
+PACK_PATTERNS = [
+    re.compile(r"pack\s+of\s+(\d+)", re.I),
+    re.compile(r"(\d+)\s*sets?\b", re.I),
+    re.compile(r"set\s+of\s+(\d+)", re.I),
+]
+
+
+def pack_size(name):
+    """Sets per unit from the product name; 1 if unnamed (e.g. Meesho) or no size stated."""
+    if not isinstance(name, str):
+        return 1
+    for pat in PACK_PATTERNS:
+        m = pat.search(name)
+        if m and int(m.group(1)) > 0:
+            return int(m.group(1))
+    return 1
+
+
 def brand_match(name):
     low = name.lower()
     for kw in VEHICLE_KEYWORDS:
@@ -72,6 +103,9 @@ def main():
     combined["order_date"] = pd.to_datetime(combined["order_date"], errors="coerce")
     combined = combined.dropna(subset=["order_date"])
     combined["period"] = combined["order_date"].dt.to_period("M")
+    # Order size = quantity (listing units) x pack size (sets per unit, from the product name).
+    combined["pack_size"] = combined["product_name"].apply(pack_size)
+    combined["sets"] = combined["quantity"].clip(lower=0) * combined["pack_size"]
 
     periods = sorted(combined["period"].unique())
     months = [month_label(p.to_timestamp()) for p in periods]
@@ -110,12 +144,37 @@ def main():
     valid = combined[combined["quantity"] > 0]
     units_by_month = series_by_month(valid, "quantity", "sum")
     units_by_month = {p: [int(v) for v in vals] for p, vals in units_by_month.items()}
+    sets_by_month = series_by_month(valid, "sets", "sum")
+    sets_by_month = {p: [int(v) for v in vals] for p, vals in sets_by_month.items()}
 
     aov = {p: round(float(rev[rev["platform"] == p]["amount"].mean()), 2) for p in revenue_platforms}
+    # Only lines with a product name have a known pack size, so per-set price skips e.g. Meesho.
+    rev_sold = rev[(rev["sets"] > 0) & rev["product_name"].notna()]
+    rev_per_set = {
+        p: round(float(rev_sold[rev_sold["platform"] == p]["amount"].sum() / rev_sold[rev_sold["platform"] == p]["sets"].sum()), 2)
+        for p in revenue_platforms if rev_sold[rev_sold["platform"] == p]["sets"].sum() > 0
+    }
 
     total_orders = int(len(combined))
     total_revenue = round(float(rev["amount"].sum()), 0)
     total_units = int(valid["quantity"].sum())
+    total_sets = int(valid["sets"].sum())
+    avg_sets_per_line = round(total_sets / len(valid), 1) if len(valid) else 0.0
+
+    # ---------- pack-size mix ----------
+    named_valid = valid[valid["product_name"].notna()]
+    pack_mix = (
+        named_valid.groupby("pack_size")
+        .agg(lines=("quantity", "size"), sets=("sets", "sum"))
+        .sort_index()
+    )
+    pack_mix_list = [[f"Pack of {int(k)}", int(r.lines), int(r.sets)] for k, r in pack_mix.iterrows()]
+    named_lines, named_sets = int(pack_mix["lines"].sum()), int(pack_mix["sets"].sum())
+    single_line_pct = pct(pack_mix["lines"].get(1, 0), named_lines)
+    multi = pack_mix[pack_mix.index >= 5]
+    multi_line_pct = pct(multi["lines"].sum(), named_lines)
+    multi_set_pct = pct(multi["sets"].sum(), named_sets)
+    unsized_lines = int(len(valid) - len(named_valid))
 
     # ---------- status buckets (Amazon / Flipkart only — the only platforms with a status field) ----------
     def amazon_bucket(s):
@@ -160,8 +219,8 @@ def main():
     vv["product_name"] = vv["product_name"].fillna("")
     named = vv[vv["product_name"] != ""]
     named = named.assign(brand=named["product_name"].apply(brand_match))
-    brand_units = named.groupby("brand")["quantity"].sum().sort_values(ascending=False)
-    brand_total_named = int(named["quantity"].sum())
+    brand_units = named.groupby("brand")["sets"].sum().sort_values(ascending=False)
+    brand_total_named = int(named["sets"].sum())
     brand_units_list = [[k, int(v)] for k, v in brand_units.items()]
     top_brand, top_brand_units = brand_units_list[0]
     top_brand_pct = pct(top_brand_units, brand_total_named)
@@ -198,10 +257,15 @@ def main():
         "revenue_by_month": revenue_by_month,
         "revenue_platforms": revenue_platforms,
         "units_by_month": units_by_month,
+        "sets_by_month": sets_by_month,
         "aov": aov,
+        "rev_per_set": rev_per_set,
         "total_orders": total_orders,
         "total_revenue": total_revenue,
         "total_units": total_units,
+        "total_sets": total_sets,
+        "avg_sets_per_line": avg_sets_per_line,
+        "pack_mix": pack_mix_list,
         "status_buckets": BUCKETS,
         "status_pct": status_pct,
         "brand_units": brand_units_list,
@@ -241,6 +305,10 @@ def main():
         revenue_insight = f"{p} is the only platform with price data here — average order value is ₹{aov[p]:.2f}."
     else:
         revenue_insight = "No platform in this dataset currently exposes item pricing."
+    if rev_per_set:
+        revenue_insight += " Per brake-pad set, that's " + ", ".join(
+            f"{p} ₹{v:.2f}" for p, v in rev_per_set.items()
+        ) + " (platforms with a product name, so pack size is known)."
     missing_rev = [p for p in platforms if p not in revenue_platforms]
     if missing_rev:
         revenue_insight += f" {', '.join(missing_rev)} revenue can't be compared — its export has no price field."
@@ -259,10 +327,24 @@ def main():
             f"Flipkart dispatch-SLA breach rate: {dispatch_sla_breach_pct}%."
         )
 
+    pack_insight = (
+        f"Order size = quantity × pack size (the \"Pack of N\" / \"N Sets\" in the product name). "
+        f"{total_units:,} listing units shipped as <b>{total_sets:,} brake-pad sets</b> "
+        f"(avg {avg_sets_per_line} sets per order line). {single_line_pct}% of named order lines are single-set "
+        f"packs, but packs of 5+ sets are {multi_line_pct}% of lines and deliver <b>{multi_set_pct}% of all sets</b>."
+    )
+    if unsized_lines:
+        pack_insight += (
+            f" {unsized_lines} line(s) with no product name (Meesho) are counted as 1 set per unit."
+        )
+
     brand_insight = (
-        f"<b>{top_brand}-compatible parts account for ~{top_brand_pct}% of all identifiable units sold</b> "
-        f"across {', '.join(revenue_platforms) or platforms[0]} and other platforms with product names — "
-        f"more than every other compatible vehicle combined." if top_brand != "Other" else
+        f"<b>{top_brand}-compatible parts account for ~{top_brand_pct}% of all identifiable brake-pad sets sold</b> "
+        f"across platforms with product names"
+        + (" — more than every other compatible vehicle combined." if top_brand_pct > 50 else
+           f" — the largest single vehicle family, ahead of {brand_units_list[1][0]} at "
+           f"{pct(brand_units_list[1][1], brand_total_named)}%." if len(brand_units_list) > 1 else ".")
+        if top_brand != "Other" else
         f"No single vehicle brand dominates — the top matched brand is {top_brand} at {top_brand_pct}%."
     )
 
@@ -277,6 +359,7 @@ def main():
         "revenue_insight": revenue_insight,
         "fulfillment_insight": fulfillment_insight,
         "brand_insight": brand_insight,
+        "pack_insight": pack_insight,
         "weekday_state_insight": weekday_state_insight,
         "latest_month": latest_month,
         "total_orders": total_orders,
@@ -286,7 +369,7 @@ def main():
     render(data, narrative)
     build_pdf(data, narrative)
     print(f"Months covered: {', '.join(months)}")
-    print(f"Total orders: {total_orders} | revenue: ₹{total_revenue:,.0f} | units: {total_units}")
+    print(f"Total orders: {total_orders} | revenue: ₹{total_revenue:,.0f} | units: {total_units} | pad sets: {total_sets}")
     print(f"Saved dashboard to {OUT_PATH}")
     print(f"Saved PDF report to {PDF_PATH}")
 
@@ -336,7 +419,7 @@ def build_pdf(data, narrative):
         kpis = [
             ("Total order lines", f"{data['total_orders']:,}"),
             ("Tracked revenue", f"₹{data['total_revenue']:,.0f}"),
-            ("Units sold", f"{data['total_units']:,}"),
+            ("Brake-pad sets sold", f"{data['total_sets']:,}"),
         ]
         for i, (label, val) in enumerate(kpis):
             x = 0.07 + i * 0.3
@@ -347,6 +430,7 @@ def build_pdf(data, narrative):
             ("Growth trajectory", narrative["growth_insight"]),
             ("Revenue", narrative["revenue_insight"]),
             ("Fulfillment health", narrative["fulfillment_insight"]),
+            ("Order size", strip_tags(narrative["pack_insight"])),
             ("Product mix", strip_tags(narrative["brand_insight"])),
             ("Timing & geography", narrative["weekday_state_insight"]),
         ]
@@ -456,32 +540,49 @@ def build_pdf(data, narrative):
         pdf.savefig(fig)
         plt.close(fig)
 
-        # ---------- Page 5: product mix + timing/geography ----------
+        # ---------- Page 5: order size + product mix ----------
         fig = plt.figure(figsize=(11, 8.5))
         gs = fig.add_gridspec(2, 2, height_ratios=[1, 1.1], hspace=0.55, wspace=0.3)
 
-        ax0 = fig.add_subplot(gs[0, :])
+        packs = data["pack_mix"][::-1]
+        for col, (idx, title) in enumerate([(1, "Order lines by pack size"), (2, "Brake-pad sets by pack size")]):
+            ax = fig.add_subplot(gs[0, col])
+            vals = [pk[idx] for pk in packs]
+            ax.barh([pk[0] for pk in packs], vals, color=COLOR["Amazon"])
+            for yi, v in enumerate(vals):
+                ax.text(v + max(vals) * 0.01, yi, f"{v:,}", va="center", fontsize=7.5, color=COLOR["text"])
+            ax.set_title(title, fontsize=9.5, loc="left", color=COLOR["text"])
+            ax.spines["top"].set_visible(False); ax.spines["right"].set_visible(False)
+            ax.tick_params(colors=COLOR["secondary"], labelsize=8)
+
+        ax0 = fig.add_subplot(gs[1, :])
         brands = data["brand_units"][::-1]
         colors = [COLOR["Amazon"] if i == len(brands) - 1 else COLOR["muted"] for i in range(len(brands))]
         ax0.barh([b[0] for b in brands], [b[1] for b in brands], color=colors)
-        ax0.set_title("Units sold by compatible vehicle (named products)", fontsize=10, loc="left", color=COLOR["text"])
+        ax0.set_title("Brake-pad sets sold by compatible vehicle (named products)", fontsize=10, loc="left", color=COLOR["text"])
         ax0.spines["top"].set_visible(False); ax0.spines["right"].set_visible(False)
         ax0.tick_params(colors=COLOR["secondary"], labelsize=8)
 
-        ax1 = fig.add_subplot(gs[1, 0])
+        fig.suptitle("Order size & product mix", fontsize=13, fontweight="bold", x=0.07, ha="left", color=COLOR["text"])
+        pdf.savefig(fig)
+        plt.close(fig)
+
+        # ---------- Page 6: timing/geography ----------
+        fig, (ax1, ax2) = plt.subplots(1, 2, figsize=(11, 5.5))
+
         wd = data["weekday"]
         ax1.bar([d[0][:3] for d in wd], [d[1] for d in wd], color=COLOR["Amazon"])
         ax1.set_title("Orders by day of week", fontsize=9.5, loc="left", color=COLOR["text"])
         style_axes(ax1)
 
-        ax2 = fig.add_subplot(gs[1, 1])
         states = data["top_states"][::-1]
         ax2.barh([s[0].title() for s in states], [s[1] for s in states], color=COLOR["Amazon"])
         ax2.set_title("Top states by order lines", fontsize=9.5, loc="left", color=COLOR["text"])
         ax2.spines["top"].set_visible(False); ax2.spines["right"].set_visible(False)
         ax2.tick_params(colors=COLOR["secondary"], labelsize=8)
 
-        fig.suptitle("Product mix, timing & geography", fontsize=13, fontweight="bold", x=0.07, ha="left", color=COLOR["text"])
+        fig.suptitle("Timing & geography", fontsize=13, fontweight="bold", x=0.07, ha="left", color=COLOR["text"])
+        fig.tight_layout(rect=[0, 0, 1, 0.92])
         pdf.savefig(fig)
         plt.close(fig)
 
@@ -623,7 +724,7 @@ TEMPLATE = r"""<!doctype html>
   <div class="kpi-row">
     <div class="kpi"><div class="label">Total order lines</div><div class="value" id="kpi-orders">—</div><div class="sub">across all marketplaces in the workbook</div></div>
     <div class="kpi"><div class="label">Tracked revenue</div><div class="value" id="kpi-revenue">—</div><div class="sub">platforms with a price field only</div></div>
-    <div class="kpi"><div class="label">Units sold</div><div class="value" id="kpi-units">—</div><div class="sub">excludes cancelled-before-ship lines</div></div>
+    <div class="kpi"><div class="label">Brake-pad sets sold</div><div class="value" id="kpi-sets">—</div><div class="sub" id="kpi-sets-sub">quantity × pack size</div></div>
     <div class="kpi"><div class="label">Latest-month run-rate</div><div class="value" id="kpi-runrate">—</div><div class="sub">orders/day, Amazon / Flipkart</div></div>
   </div>
 
@@ -679,10 +780,25 @@ TEMPLATE = r"""<!doctype html>
   </section>
 
   <section class="panel">
+    <h2>Order size</h2>
+    <p class="insight">__PACK_INSIGHT__</p>
+    <div class="chart-row">
+      <div class="chart-box chart-scroll">
+        <p class="chart-title">Order lines by pack size</p>
+        <svg id="chart-pack-lines" viewBox="0 0 480 220"></svg>
+      </div>
+      <div class="chart-box chart-scroll">
+        <p class="chart-title">Brake-pad sets by pack size</p>
+        <svg id="chart-pack-sets" viewBox="0 0 480 220"></svg>
+      </div>
+    </div>
+  </section>
+
+  <section class="panel">
     <h2>Product mix</h2>
     <p class="insight">__BRAND_INSIGHT__</p>
     <div class="chart-box chart-scroll">
-      <p class="chart-title">Units sold by compatible vehicle (named products)</p>
+      <p class="chart-title">Brake-pad sets sold by compatible vehicle (named products)</p>
       <svg id="chart-brand" viewBox="0 0 700 220"></svg>
     </div>
   </section>
@@ -935,7 +1051,8 @@ const num = v => Math.round(v).toLocaleString('en-IN');
 
 document.getElementById('kpi-orders').textContent = num(DATA.total_orders);
 document.getElementById('kpi-revenue').textContent = inr(DATA.total_revenue);
-document.getElementById('kpi-units').textContent = num(DATA.total_units);
+document.getElementById('kpi-sets').textContent = num(DATA.total_sets);
+document.getElementById('kpi-sets-sub').textContent = 'quantity × pack size · from ' + num(DATA.total_units) + ' listing units';
 {
   const n = DATA.months.length - 1;
   const a = DATA.daily_rate_by_month.Amazon ? DATA.daily_rate_by_month.Amazon[n].toFixed(1) : '—';
@@ -978,9 +1095,20 @@ drawHorizBars('chart-returns', DATA.return_reasons, COLORS.serious, { labelW: 16
 const brandTotal = DATA.brand_total_named;
 drawHorizBars('chart-brand', DATA.brand_units, COLORS.amazon, {
   labelW: 130,
-  valueLabel: v => v + ' units · ' + (100 * v / brandTotal).toFixed(0) + '%',
+  valueLabel: v => num(v) + ' sets · ' + (100 * v / brandTotal).toFixed(0) + '%',
   colorFn: (label, v, i) => i === 0 ? COLORS.amazon : 'var(--text-muted)',
 });
+
+{
+  const lineTotal = DATA.pack_mix.reduce((a, r) => a + r[1], 0);
+  const setTotal = DATA.pack_mix.reduce((a, r) => a + r[2], 0);
+  drawHorizBars('chart-pack-lines', DATA.pack_mix.map(r => [r[0], r[1]]), COLORS.amazon, {
+    labelW: 90, valueLabel: v => num(v) + ' · ' + (100 * v / lineTotal).toFixed(0) + '%',
+  });
+  drawHorizBars('chart-pack-sets', DATA.pack_mix.map(r => [r[0], r[2]]), COLORS.amazon, {
+    labelW: 90, valueLabel: v => num(v) + ' · ' + (100 * v / setTotal).toFixed(0) + '%',
+  });
+}
 
 drawSingleBars('chart-weekday', DATA.weekday.map(([d, v]) => [d.slice(0, 3), v]), COLORS.amazon, {});
 

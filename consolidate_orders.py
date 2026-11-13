@@ -1,14 +1,22 @@
 """
-Consolidates Amazon / Flipkart / Meesho order-report xlsx files in this folder
-into Consolidated_Orders.xlsx (sheets: Combined, Amazon, Flipkart, Meesho).
+Consolidates Amazon / Flipkart / Meesho order reports in this folder into
+Consolidated_Orders.xlsx (sheets: Combined, Amazon, Flipkart, Meesho).
+
+Amazon reports are read either as the native tab-separated .txt download
+("All Orders" flat file) or as .xlsx. Flipkart and Meesho reports are .xlsx.
+Amazon rows are de-duplicated on order-item-id (keeping the most recently
+updated row), so overlapping date-range reports don't double-count orders.
 
 Incremental: if Consolidated_Orders.xlsx already exists, only report files not
 already recorded in it (tracked by filename) are parsed and appended. If it
 doesn't exist yet, it is built from scratch from every matching file here.
 
-Usage: drop new monthly report files into this folder (any filename containing
+Usage: drop new report files into this folder (any filename containing
 "amazon", "flipkart", or "meesho", case-insensitive), then run:
     python3 consolidate_orders.py
+
+Combined-sheet order_date is in Indian Standard Time for every platform
+(Amazon's UTC timestamps are converted).
 
 Requires: pandas, openpyxl
 """
@@ -21,8 +29,8 @@ BASE = os.path.dirname(os.path.abspath(__file__))
 OUT_PATH = os.path.join(BASE, "Consolidated_Orders.xlsx")
 
 
-def find_files(keyword):
-    files = glob.glob(os.path.join(BASE, "*.xlsx"))
+def find_files(keyword, exts=("xlsx",)):
+    files = [f for ext in exts for f in glob.glob(os.path.join(BASE, f"*.{ext}"))]
     return sorted(
         f for f in files
         if keyword in os.path.basename(f).lower()
@@ -61,8 +69,20 @@ def new_files_only(files, existing_df):
     return [f for f in files if os.path.basename(f) not in already]
 
 
+def read_amazon_txt(fname):
+    for enc in ("utf-8-sig", "cp1252"):
+        try:
+            return pd.read_csv(fname, sep="\t", encoding=enc, dtype={"amazon-order-id": str, "order-item-id ": str, "order-item-id": str})
+        except UnicodeDecodeError:
+            continue
+    raise ValueError(f"Could not decode {fname}")
+
+
 def parse_amazon(fname):
-    df = pd.read_excel(fname, sheet_name=0)
+    if fname.lower().endswith(".txt"):
+        df = read_amazon_txt(fname)
+    else:
+        df = pd.read_excel(fname, sheet_name=0)
     df.columns = [c.strip() for c in df.columns]
     df.insert(0, "report_month", month_label(df["purchase-date"]))
     df.insert(1, "source_file", os.path.basename(fname))
@@ -88,9 +108,23 @@ def parse_meesho(fname):
     return df
 
 
-def build_platform(keyword, parse_fn, sheet_name):
+def dedupe_amazon(df):
+    if df.empty or "order-item-id" not in df.columns:
+        return df
+    key = df["order-item-id"].astype(str).str.strip().str.replace(r"\.0$", "", regex=True)
+    updated = pd.to_datetime(df["last-updated-date"], errors="coerce", utc=True)
+    order = updated.sort_values(kind="stable", na_position="first").index
+    keep = ~key.loc[order].duplicated(keep="last")
+    deduped = df.loc[keep[keep].index].sort_index()
+    dropped = len(df) - len(deduped)
+    if dropped:
+        print(f"Amazon: replaced {dropped} duplicate order line(s) with their latest version")
+    return deduped.reset_index(drop=True)
+
+
+def build_platform(keyword, parse_fn, sheet_name, exts=("xlsx",)):
     existing = load_existing_sheet(sheet_name)
-    new_files = new_files_only(find_files(keyword), existing)
+    new_files = new_files_only(find_files(keyword, exts), existing)
     new_frames = [parse_fn(f) for f in new_files]
     if new_files:
         print(f"{sheet_name}: adding {len(new_files)} new file(s) -> {[os.path.basename(f) for f in new_files]}")
@@ -100,7 +134,7 @@ def build_platform(keyword, parse_fn, sheet_name):
     return pd.concat(frames, ignore_index=True) if frames else pd.DataFrame()
 
 
-amazon_all = build_platform("amazon", parse_amazon, "Amazon")
+amazon_all = dedupe_amazon(build_platform("amazon", parse_amazon, "Amazon", exts=("xlsx", "txt")))
 flipkart_all = build_platform("flipkart", parse_flipkart, "Flipkart")
 meesho_all = build_platform("meesho", parse_meesho, "Meesho")
 
@@ -113,7 +147,8 @@ def norm_amazon(df):
         "platform": "Amazon",
         "report_month": df["report_month"],
         "order_id": df["amazon-order-id"],
-        "order_date": pd.to_datetime(df["purchase-date"], errors="coerce", utc=True).dt.tz_localize(None),
+        "order_date": pd.to_datetime(df["purchase-date"], errors="coerce", utc=True)
+                        .dt.tz_convert("Asia/Kolkata").dt.tz_localize(None),
         "product_name": df["product-name"],
         "sku": df["sku"],
         "quantity": df["quantity"],
@@ -190,11 +225,24 @@ flipkart_all = sort_by_date_desc(flipkart_all, "order_date")
 meesho_all = sort_by_date_desc(meesho_all, "order_date")
 
 # ---------- WRITE OUTPUT ----------
+def autofit_columns(ws, max_width=60):
+    for col in ws.columns:
+        longest = max((len(str(c.value)) for c in col if c.value is not None), default=0)
+        ws.column_dimensions[col[0].column_letter].width = min(max_width, longest + 2)
+
+
 with pd.ExcelWriter(OUT_PATH, engine="openpyxl") as writer:
     combined.to_excel(writer, sheet_name="Combined", index=False)
     amazon_all.to_excel(writer, sheet_name="Amazon", index=False)
     flipkart_all.to_excel(writer, sheet_name="Flipkart", index=False)
     meesho_all.to_excel(writer, sheet_name="Meesho", index=False)
+    for ws in writer.book.worksheets:
+        autofit_columns(ws)
+    ws = writer.book["Combined"]
+    date_col = combined.columns.get_loc("order_date") + 1
+    for (cell,) in ws.iter_rows(min_row=2, min_col=date_col, max_col=date_col):
+        cell.number_format = "dd-mmm-yyyy hh:mm"
+    ws.column_dimensions[ws.cell(1, date_col).column_letter].width = 20
 
 print(f"Combined: {len(combined)} rows | Amazon: {len(amazon_all)} | Flipkart: {len(flipkart_all)} | Meesho: {len(meesho_all)}")
 print(f"Saved to {OUT_PATH}")
