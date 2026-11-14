@@ -21,6 +21,7 @@ import calendar
 import json
 import os
 import re
+import sys
 import textwrap
 
 import matplotlib
@@ -32,6 +33,9 @@ from matplotlib.backends.backend_pdf import PdfPages
 import pandas as pd
 
 BASE = os.path.dirname(os.path.abspath(__file__))
+
+# Windows consoles may not support characters like "₹"; print a placeholder instead of crashing.
+sys.stdout.reconfigure(errors="replace")
 IN_PATH = os.path.join(BASE, "Consolidated_Orders.xlsx")
 OUT_PATH = os.path.join(BASE, "Orders_Dashboard.html")
 PDF_PATH = os.path.join(BASE, "Orders_Dashboard.pdf")
@@ -398,7 +402,7 @@ def render(data, narrative):
     html = html.replace("__DATA_JSON__", json.dumps(data))
     for key, val in narrative.items():
         html = html.replace("__" + key.upper() + "__", str(val))
-    with open(OUT_PATH, "w") as f:
+    with open(OUT_PATH, "w", encoding="utf-8") as f:
         f.write(html)
 
 

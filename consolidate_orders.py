@@ -24,10 +24,14 @@ Requires: pandas, openpyxl
 """
 import glob
 import os
+import sys
 
 import pandas as pd
 
 BASE = os.path.dirname(os.path.abspath(__file__))
+
+# Windows consoles may not support characters like "₹"; print a placeholder instead of crashing.
+sys.stdout.reconfigure(errors="replace")
 OUT_PATH = os.path.join(BASE, "Consolidated_Orders.xlsx")
 
 
